@@ -1,8 +1,14 @@
 #include <iostream>
 #include <vector>
+#include <cassert>
 
 #include <SDL3/SDL.h>
 #include <stb_image.h>
+
+#define KERN_RADIUS 8
+#define IMG "Lena_512.png"
+#define WINDOW_WIDTH 1920
+#define WINDOW_HEIGHT 1080
 
 struct Image
 {
@@ -15,7 +21,7 @@ struct Image
 auto load_image()
 {
     Image result;
-    result.data = stbi_load("Lena_512.png", &result.width, &result.height, &result.channels, 1); // 1 channels loads grey
+    result.data = stbi_load(IMG, &result.width, &result.height, &result.channels, 1); // 1 channels loads grey
     return result;
 }
 
@@ -24,16 +30,18 @@ Image mean_filter(const Image& src_img, int window_radius)
     auto total_pixels = src_img.width * src_img.height;
     Image result;
     result.data = new unsigned char[total_pixels];
-
-    // zero it
     memset(result.data, 0, total_pixels);
 
     result.width = src_img.width;
     result.height = src_img.height;
     result.channels = 1;
 
-    // should be `d` rows of `n - d` rolling sums
+    // cache of rolling 2d sum
+    std::vector<int> sums;
+    sums.resize(result.width * result.height);
+    // cache of row-wise sums. Should be d * 'n - d' elements
     std::vector<std::vector<int>> row_sums;
+
     int d = 2 * window_radius;
     int d2 = d * d;
 
@@ -52,57 +60,74 @@ Image mean_filter(const Image& src_img, int window_radius)
         for (int col = window_radius + 1; col < result.width - window_radius; col++)
         {
             int prev_sum = row_cache[col - window_radius - 1];
-            int prev_px = src_img.data[row_idx + col - window_radius - 1];
             int next_px = src_img.data[row_idx + col + window_radius];
+            int prev_px = src_img.data[row_idx + col - window_radius - 1];
             int new_sum = prev_sum + next_px - prev_px;
             row_cache.push_back(new_sum);
         }
         row_sums.push_back(row_cache);
     }
 
-    // we now have a full row sum cache. it has the 1d sum along the row centered at each px in it.
-    for (int row = window_radius; row < result.height - window_radius; row++)
+    // for the first row, we just want to sum what is in cache
+    for (int col = window_radius; col < result.width - window_radius; col++)
     {
-        // get the rolling average value for this pixel by summing along the column in the cache
-        int row_idx = row * result.width;
+        int idx = (window_radius * result.width) + col;
+        int sum = 0;
+        for (int k = 0; k < d; k++)
+        {
+            sum += row_sums[k][col - window_radius];
+        }
+        sums[idx] = sum;
+    }
+
+    for (int row = window_radius + 1; row < result.height - window_radius; row++)
+    {
+        // push a new row to the cache and compute the first rowwise sum
+        std::vector<int> next_row_cache;
+        int rolling_row_sum = 0;
+        const auto row_idx = row * result.width;
+        const auto last_kern_row_idx = (row + window_radius) * result.width;
+        for (int i = 0; i < d; i++)
+        {
+            rolling_row_sum += src_img.data[last_kern_row_idx + i];
+        }
+        next_row_cache.push_back(rolling_row_sum);
+        row_sums.push_back(next_row_cache);
+
         for (int col = window_radius; col < result.width - window_radius; col++)
         {
-            int avg = 0;
-            int cache_idx = col - window_radius;
-            for (int row_cache = 0; row_cache < d; row_cache++)
-            {
-                avg += row_sums[row_cache][cache_idx];
-            }
-            result.data[row_idx + col] = avg / d2;
-            
-            // get the next col value
-            if (col < result.width - window_radius - 1)
-            {
-                auto last_row_idx = (row + window_radius) * result.width;
+            auto& last_row = row_sums.back();
+            auto& first_row = row_sums.front();
 
-                int new_val = src_img.data[last_row_idx + col + window_radius + 1];
-                int old_val = src_img.data[last_row_idx + col - window_radius];
+            // do this pixel first
+            const auto cache_idx = col - window_radius;
 
-                auto& last_row = row_sums.back();
-                auto new_sum = last_row[cache_idx] + new_val - old_val;
-                last_row.push_back(new_sum);
+            const auto last_avg_idx = ((row - 1) * result.width) + col;
+            auto avg = sums[last_avg_idx];
+            const auto first_row_sum = first_row[cache_idx];
+            const auto last_row_sum = last_row[cache_idx];
+            avg += last_row_sum - first_row_sum;
+            sums[row_idx + col] = avg;
+
+            if (col + window_radius + 1 < result.width)
+            {
+                // compute the next row sum
+                const auto new_row_val = src_img.data[last_kern_row_idx + col + 1 + window_radius];
+                const auto old_row_val = src_img.data[last_kern_row_idx + col + 1 - window_radius];
+
+                const auto new_row_sum = last_row_sum + new_row_val - old_row_val;
+                last_row.push_back(new_row_sum);
             }
         }
 
-        if (row < result.height - window_radius - 1)
-        {
-            // cycle the row cache
-            row_sums.erase(row_sums.begin());
-            std::vector<int> next_row_cache;
-            int rolling_row_sum = 0;
-            int row_idx = (row + window_radius + 1) * result.width;
-            for (int i = 0; i < d; i++)
-            {
-                rolling_row_sum += src_img.data[row_idx + i];
-            }
-            next_row_cache.push_back(rolling_row_sum);
-            row_sums.push_back(next_row_cache);
-        }
+        row_sums.erase(row_sums.begin());
+    }
+
+    // finally we do a pass and just divide everything
+    for (int i = 0; i < result.width * result.height; i++)
+    {
+        const auto s = sums[i];
+        result.data[i] = s / d2;
     }
 
     return result;
@@ -112,7 +137,7 @@ int main()
 {
     SDL_Init(SDL_INIT_VIDEO);
 
-    SDL_Window* window = SDL_CreateWindow("rigel", 1920, 1080, 0);
+    SDL_Window* window = SDL_CreateWindow("rigel", WINDOW_WIDTH, WINDOW_HEIGHT, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
 
     int w, h;
@@ -145,11 +170,12 @@ int main()
     }
     SDL_UnlockTexture(texture);
 
-    auto orig_x = (1920 / 2) - image.width;
-    auto orig_y = (1080 / 2) - (image.height / 2);
+    auto orig_x = (WINDOW_WIDTH / 2) - image.width;
+    auto orig_y = (WINDOW_HEIGHT / 2) - (image.height / 2);
     const SDL_FRect img_rect { (float)orig_x, (float)orig_y, (float)image.width, (float)image.height };
 
-    auto mean_filtered = mean_filter(image, 4);
+    auto mean_filtered = mean_filter(image, KERN_RADIUS);
+
     auto mean_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, image.width, image.height);
     if (!SDL_LockTexture(mean_texture, nullptr, (void**)&tex_data, &pitch))
     {
@@ -166,8 +192,8 @@ int main()
     }
     SDL_UnlockTexture(mean_texture);
 
-    auto mean_x = (1920 / 2);
-    auto mean_y = (1080 / 2) - (image.height / 2);
+    auto mean_x = (WINDOW_WIDTH / 2);
+    auto mean_y = (WINDOW_HEIGHT / 2) - (image.height / 2);
     const SDL_FRect mean_img_rect { (float)mean_x, (float)mean_y, (float)mean_filtered.width, (float)mean_filtered.height };
     
     bool should_run = true;
